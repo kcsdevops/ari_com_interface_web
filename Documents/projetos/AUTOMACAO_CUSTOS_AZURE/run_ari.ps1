@@ -1,17 +1,37 @@
 # Script para executar o ARI usando PowerShell 7
+param(
+    [string]$TenantID = "",
+    [string]$SubscriptionIDs = "",
+    [switch]$IncludeTags = $true,
+    [switch]$IncludeCosts = $true,
+    [string]$ReportDir = ""
+)
+
 # Definir timeout para operações (2 horas)
 $maxTimeout = 7200
 
 # Verificar se está sendo executado no PowerShell 7
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     Write-Host "Este script requer PowerShell 7 ou superior. Executando com PowerShell 7..." -ForegroundColor Yellow
+    
+    # Construir a linha de comando com os mesmos parâmetros
+    $arguments = @("-File", $PSCommandPath)
+    if ($TenantID) { $arguments += "-TenantID"; $arguments += $TenantID }
+    if ($SubscriptionIDs) { $arguments += "-SubscriptionIDs"; $arguments += $SubscriptionIDs }
+    if ($IncludeTags) { $arguments += "-IncludeTags" }
+    if ($IncludeCosts) { $arguments += "-IncludeCosts" }
+    if ($ReportDir) { $arguments += "-ReportDir"; $arguments += $ReportDir }
+    
     # Reexecutar o script com pwsh.exe (PowerShell 7)
-    & pwsh.exe -File $PSCommandPath
+    & pwsh.exe $arguments
     exit
 }
 
 # Criar diretório de saída se não existir
-$ReportDir = "$PSScriptRoot\data\ari_output"
+if (-not $ReportDir) {
+    $ReportDir = "$PSScriptRoot\data\ari_output"
+}
+
 if (-not (Test-Path -Path $ReportDir)) {
     New-Item -Path $ReportDir -ItemType Directory -Force | Out-Null
     Write-Host "Diretório de relatórios criado: $ReportDir" -ForegroundColor Green
@@ -58,13 +78,40 @@ catch {
 # Executar o ARI com um job para evitar que o script trave indefinidamente
 Write-Host "Iniciando execução do ARI..." -ForegroundColor Cyan
 
+# Preparar os parâmetros para o Invoke-ARI
+$ariParams = @{
+    ReportDir = $ReportDir
+}
+
+# Adicionar parâmetros condicionais
+if ($IncludeTags) {
+    $ariParams.Add("IncludeTags", $true)
+}
+
+if ($IncludeCosts) {
+    $ariParams.Add("IncludeCosts", $true)
+}
+
+if ($TenantID) {
+    $ariParams.Add("TenantID", $TenantID)
+}
+
+if ($SubscriptionIDs) {
+    $subscriptionList = $SubscriptionIDs -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if ($subscriptionList.Count -gt 0) {
+        $ariParams.Add("SubscriptionID", $subscriptionList)
+    }
+}
+
+Write-Host "Parâmetros do ARI: $($ariParams | ConvertTo-Json -Compress)" -ForegroundColor Cyan
+
 try {
     $job = Start-Job -ScriptBlock {
-        param($modulePath, $reportDir)
+        param($modulePath, $params)
         
         Import-Module -Name $modulePath -Force
-        Invoke-ARI -ReportDir $reportDir -IncludeTags -IncludeCosts -Verbose
-    } -ArgumentList "$PSScriptRoot\ARI\AzureResourceInventory.psd1", $ReportDir
+        Invoke-ARI @params -Verbose
+    } -ArgumentList "$PSScriptRoot\ARI\AzureResourceInventory.psd1", $ariParams
 
     # Esperar pelo job com timeout
     $jobComplete = Wait-Job -Job $job -Timeout $maxTimeout
