@@ -1,0 +1,356 @@
+name: ARI GitOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+      - 'feature/**'
+      - 'hotfix/**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      forceRebuild:
+        description: 'Force rebuild image'
+        type: boolean
+        default: false
+      skipTests:
+        description: 'Skip tests'
+        type: boolean
+        default: false
+
+env:
+  APP_NAME: ari-automation
+  AZURE_APP_NAME: ${{ secrets.WEBAPP_NAME || 'ari-automation-app' }}
+  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP || 'ari-automation-rg' }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      shortSha: ${{ steps.shortsha.outputs.short_sha }}
+      fullVersion: ${{ steps.fullversion.outputs.full_version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Generate short SHA
+        id: shortsha
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Semantic Versioning
+        id: semver
+        uses: paulhatch/semantic-version@v5.0.3
+        with:
+          tag_prefix: "v"
+          major_pattern: "BREAKING CHANGE"
+          minor_pattern: "feat:"
+          patch_pattern: "fix:"
+          version_format: "${major}.${minor}.${patch}"
+      
+      - name: Generate full version
+        id: fullversion
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # Use exact tag if it's a tag push
+            echo "full_version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/main ]]; then
+            # For main branch, use semver with commit sha
+            echo "full_version=${{ steps.semver.outputs.version }}-sha-${{ steps.shortsha.outputs.short_sha }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            # For release branches
+            BRANCH_NAME=${GITHUB_REF#refs/heads/release/}
+            echo "full_version=${{ steps.semver.outputs.version }}-rc-${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          else
+            # For feature branches
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+            SAFE_BRANCH_NAME=$(echo ${BRANCH_NAME} | sed -r 's/\//-/g')
+            echo "full_version=${{ steps.semver.outputs.version }}-${SAFE_BRANCH_NAME}-${{ steps.shortsha.outputs.short_sha }}" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    needs: version
+    if: ${{ github.event.inputs.skipTests != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+      
+      - name: Run tests
+        run: |
+          pytest --cov=src
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            .coverage
+            coverage.xml
+            htmlcov/
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [version, test]
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    outputs:
+      imageTag: ${{ steps.buildImage.outputs.imageTag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ secrets.ACR_URL || 'ghcr.io' }}
+          username: ${{ secrets.ACR_USERNAME || github.actor }}
+          password: ${{ secrets.ACR_PASSWORD || secrets.GITHUB_TOKEN }}
+      
+      - name: Determine image repository
+        id: imageRepo
+        run: |
+          if [[ -n "${{ secrets.ACR_URL }}" ]]; then
+            echo "repository=${{ secrets.ACR_URL }}/${{ env.APP_NAME }}" >> $GITHUB_OUTPUT
+          else
+            echo "repository=ghcr.io/${{ github.repository }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Build and push image
+        id: buildImage
+        uses: docker/build-push-action@v4
+        with:
+          context: ./webapp
+          push: true
+          tags: |
+            ${{ steps.imageRepo.outputs.repository }}:${{ needs.version.outputs.fullVersion }}
+            ${{ steps.imageRepo.outputs.repository }}:latest
+          cache-from: type=registry,ref=${{ steps.imageRepo.outputs.repository }}:latest
+          cache-to: type=inline
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.fullVersion }}
+      
+      - name: Output image tag
+        id: imageTag
+        run: echo "imageTag=${{ steps.imageRepo.outputs.repository }}:${{ needs.version.outputs.fullVersion }}" >> $GITHUB_OUTPUT
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/feature/')) && github.event_name != 'pull_request' }}
+    environment: dev
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Deploy to Dev environment
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_APP_NAME }}-dev
+          images: ${{ needs.build.outputs.imageTag }}
+      
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ env.AZURE_APP_NAME }}-dev --resource-group ${{ env.RESOURCE_GROUP }} --settings \
+              AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }} \
+              AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }} \
+              AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }} \
+              AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }} \
+              AZURE_STORAGE_CONNECTION_STRING=${{ secrets.AZURE_STORAGE_CONNECTION_STRING }} \
+              ENVIRONMENT=development \
+              APP_VERSION=${{ needs.version.outputs.fullVersion }} \
+              SECRET_KEY=${{ secrets.SECRET_KEY }}
+      
+      - name: Health check
+        id: healthcheck
+        run: |
+          # Wait for app to start
+          sleep 30
+          
+          # Check health endpoint
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_APP_NAME }}-dev.azurewebsites.net/health)
+          echo "Status code: $STATUS_CODE"
+          
+          if [[ "$STATUS_CODE" == "200" ]]; then
+            echo "health_status=healthy" >> $GITHUB_OUTPUT
+          else
+            echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [version, build, deploy-dev]
+    if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name != 'pull_request' && needs.deploy-dev.result == 'success' }}
+    environment: staging
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Deploy to Staging environment
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_APP_NAME }}-staging
+          images: ${{ needs.build.outputs.imageTag }}
+      
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ env.AZURE_APP_NAME }}-staging --resource-group ${{ env.RESOURCE_GROUP }} --settings \
+              AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }} \
+              AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }} \
+              AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }} \
+              AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }} \
+              AZURE_STORAGE_CONNECTION_STRING=${{ secrets.AZURE_STORAGE_CONNECTION_STRING }} \
+              ENVIRONMENT=staging \
+              APP_VERSION=${{ needs.version.outputs.fullVersion }} \
+              SECRET_KEY=${{ secrets.SECRET_KEY }}
+      
+      - name: Health check
+        id: healthcheck
+        run: |
+          # Wait for app to start
+          sleep 30
+          
+          # Check health endpoint
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_APP_NAME }}-staging.azurewebsites.net/health)
+          echo "Status code: $STATUS_CODE"
+          
+          if [[ "$STATUS_CODE" == "200" ]]; then
+            echo "health_status=healthy" >> $GITHUB_OUTPUT
+          else
+            echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: [version, build, deploy-staging]
+    if: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && github.event_name != 'pull_request' && needs.deploy-staging.result == 'success' }}
+    environment: production
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Deploy to Production environment
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_APP_NAME }}
+          images: ${{ needs.build.outputs.imageTag }}
+          slot-name: staging
+      
+      - name: Configure App Settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp config appsettings set --name ${{ env.AZURE_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --slot staging --settings \
+              AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }} \
+              AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }} \
+              AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }} \
+              AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }} \
+              AZURE_STORAGE_CONNECTION_STRING=${{ secrets.AZURE_STORAGE_CONNECTION_STRING }} \
+              ENVIRONMENT=production \
+              APP_VERSION=${{ needs.version.outputs.fullVersion }} \
+              SECRET_KEY=${{ secrets.SECRET_KEY }}
+      
+      - name: Health check staging slot
+        id: healthcheck
+        run: |
+          # Wait for app to start
+          sleep 30
+          
+          # Check health endpoint
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_APP_NAME }}-staging.azurewebsites.net/health)
+          echo "Status code: $STATUS_CODE"
+          
+          if [[ "$STATUS_CODE" == "200" ]]; then
+            echo "health_status=healthy" >> $GITHUB_OUTPUT
+          else
+            echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: Swap slots
+        if: steps.healthcheck.outputs.health_status == 'healthy'
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az webapp deployment slot swap -g ${{ env.RESOURCE_GROUP }} -n ${{ env.AZURE_APP_NAME }} --slot staging --target-slot production
+      
+      - name: Final health check production
+        run: |
+          # Wait for swap to complete
+          sleep 30
+          
+          # Check health endpoint
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ env.AZURE_APP_NAME }}.azurewebsites.net/health)
+          echo "Status code: $STATUS_CODE"
+          
+          if [[ "$STATUS_CODE" != "200" ]]; then
+            # If health check fails, swap back
+            echo "Health check failed! Performing automatic rollback..."
+            az webapp deployment slot swap -g ${{ env.RESOURCE_GROUP }} -n ${{ env.AZURE_APP_NAME }} --slot staging --target-slot production
+            exit 1
+          else
+            echo "Deployment to production successful!"
+          fi
+      
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body: |
+            Release ${{ github.ref_name }}
+            
+            Version: ${{ needs.version.outputs.fullVersion }}
+            
+            Image: ${{ needs.build.outputs.imageTag }}
+            
+            Deployment timestamp: ${{ github.event.repository.updated_at }}
+            
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
